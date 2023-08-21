@@ -53,6 +53,10 @@ struct OpenVpnMgmnt {
     sock_write: BufSockWrite,
 }
 
+pub fn is_valid_server_name(name: &str) -> bool {
+    lazy_regex::regex_is_match!("^[a-z0-9]+$", name)
+}
+
 impl OpenVpnMgmnt {
     fn is_bad_line(line: &str) -> bool {
         line.contains("END") || line.contains("ERROR")
@@ -68,10 +72,11 @@ impl OpenVpnMgmnt {
     }
 
     pub async fn open(server_name: &str) -> anyhow::Result<OpenVpnMgmnt> {
-        if !lazy_regex::regex_is_match!("^[a-z0-9]+$", server_name) {
+        if !is_valid_server_name(server_name) {
             anyhow::bail!("openvpn server name can only contain lowercase letters and numbers");
         }
 
+        // TODO: don't hardcode this path
         let sock_path = format!("/var/etc/openvpn/{}/sock", server_name);
         let (sock_read, sock_write) = tokio::net::UnixStream::connect(&sock_path)
             .await
@@ -194,9 +199,37 @@ impl OpenVpnMgmnt {
     }
 }
 
-#[actix_web::get("/openvpn/{server}")]
+async fn filter_from_logs() -> anyhow::Result<serde_json::Value> {
+    let mut logs = tokio::io::BufReader::new(
+        tokio::fs::OpenOptions::default()
+            .read(true)
+            .open("/var/log/openvpn.log")
+            .await
+            .context("couldn't open openvpn log file")?,
+    );
+
+    let mut line_buffer = String::with_capacity(LINE_BUF_SIZE);
+    let mut relevant = Vec::new();
+    loop {
+        if logs.read_line(&mut line_buffer).await.unwrap() == 0 {
+            break;
+        }
+        let line = line_buffer.trim();
+
+        if !line.ends_with("connected") && !line.ends_with("disconnected") {
+            line_buffer.clear();
+            continue;
+        }
+
+        relevant.push(line.to_string());
+        line_buffer.clear();
+    }
+
+    serde_json::to_value(relevant).context("couldn't convert logs to json value")
+}
+
+#[actix_web::get("/openvpn/status/{server}")]
 async fn get_server(path: web::Path<String>) -> HttpResponse {
-    log::info!("connecting to socket");
     let mut openvpn = match OpenVpnMgmnt::open(&path).await {
         Err(err) => {
             log::error!("{}", err);
@@ -205,6 +238,7 @@ async fn get_server(path: web::Path<String>) -> HttpResponse {
         Ok(v) => v,
     };
 
+    let start = std::time::Instant::now();
     let val = match openvpn.execute_to_map("status 2", "CLIENT_LIST").await {
         Err(err) => {
             log::error!("{}", err);
@@ -212,7 +246,35 @@ async fn get_server(path: web::Path<String>) -> HttpResponse {
         }
         Ok(v) => v,
     };
-    HttpResponse::Ok().json(&val)
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "elapsed_ms": elapsed_ms,
+        "data": val,
+    }))
+}
+
+#[actix_web::get("/openvpn/auth/{server}")]
+async fn get_auth(path: web::Path<String>) -> HttpResponse {
+    if !is_valid_server_name(&path) {
+        log::error!("invalid server name `{}`", path);
+        return HttpResponse::InternalServerError().finish();
+    }
+
+    let start = std::time::Instant::now();
+    let logs = match filter_from_logs().await {
+        Err(err) => {
+            log::error!("{}", err);
+            return HttpResponse::InternalServerError().finish();
+        }
+        Ok(v) => v,
+    };
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "elapsed_ms": elapsed_ms,
+        "data": logs,
+    }))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -222,7 +284,7 @@ pub async fn main() {
     let server = HttpServer::new(move || {
         App::new()
             .wrap(middleware::Compress::default())
-            .service(web::scope("/api").service(get_server))
+            .service(web::scope("/api").service(get_server).service(get_auth))
     });
 
     server
