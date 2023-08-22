@@ -3,8 +3,11 @@
 mod logs;
 mod socket;
 
+use std::str::FromStr;
+
 use actix_web::{middleware, web, App, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 
 use crate::socket::OpenVpnMgmnt;
 
@@ -76,21 +79,38 @@ async fn get_server(path: web::Path<String>) -> HttpResponse {
     }))
 }
 
-#[actix_web::get("/openvpn/auth/{server}")]
-async fn get_auth(path: web::Path<String>) -> HttpResponse {
-    if !lazy_regex::regex_is_match!("^[a-z0-9]+$", &path) {
-        log::error!("invalid server name `{}`", path);
-        return HttpResponse::InternalServerError().finish();
-    }
-
+#[derive(Debug, Deserialize)]
+struct AuthQuery {
+    server: Option<String>,
+    user: Option<String>,
+    event: Option<String>,
+}
+#[actix_web::get("/openvpn/auth")]
+async fn get_auth(query: web::Query<AuthQuery>) -> HttpResponse {
     let start = std::time::Instant::now();
-    let logs = match logs::filter_from_logs().await {
+    let mut logs = match logs::filter_from_logs().await {
         Err(err) => {
             log::error!("{}", err);
             return HttpResponse::InternalServerError().finish();
         }
         Ok(v) => v,
     };
+    if let Some(server) = query.server.as_ref() {
+        logs.retain(|l| &l.server == server);
+    }
+    if let Some(event) = query.event.as_ref() {
+        let event = match logs::LogEvent::from_str(event) {
+            Err(err) => {
+                log::error!("{}", err);
+                return HttpResponse::InternalServerError().finish();
+            }
+            Ok(v) => v,
+        };
+        logs.retain(|l| l.event == event);
+    }
+    if let Some(user) = query.user.as_ref() {
+        logs.retain(|l| &l.user == user);
+    }
     let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
 
     HttpResponse::Ok().json(serde_json::json!({

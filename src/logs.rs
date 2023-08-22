@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, str::FromStr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Local, TimeZone, Utc};
@@ -9,7 +12,7 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::LINE_BUF_SIZE;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
 pub enum LogEvent {
     Connecting,
     Connected,
@@ -30,11 +33,12 @@ impl FromStr for LogEvent {
 
 #[derive(Debug, Serialize)]
 pub struct LogEntry {
-    event: LogEvent,
-    time: DateTime<Local>,
-    ip: SocketAddr,
-    user: String,
-    server: String,
+    pub event: LogEvent,
+    pub time: DateTime<Local>,
+    pub ip: IpAddr,
+    pub port: u16,
+    pub user: String,
+    pub server: String,
 }
 
 impl TryFrom<&SyslogMessage> for LogEntry {
@@ -67,18 +71,21 @@ impl TryFrom<&SyslogMessage> for LogEntry {
             anyhow::bail!("msg splits into too many parts");
         }
 
+        let sock_addr = SocketAddr::from_str(splits[6].trim_matches('\''))
+            .context("invalid socket address in message")?;
+
         Ok(LogEntry {
             event: LogEvent::from_str(splits[8])?,
             time,
-            ip: SocketAddr::from_str(splits[6].trim_matches('\''))
-                .context("invalid socket address in message")?,
+            ip: sock_addr.ip(),
+            port: sock_addr.port(),
             user: splits[4].trim_matches('\'').to_string(),
             server: splits[2].trim_matches('\'').to_string(),
         })
     }
 }
 
-pub async fn filter_from_logs() -> anyhow::Result<serde_json::Value> {
+pub async fn filter_from_logs() -> anyhow::Result<Vec<LogEntry>> {
     let mut logs = tokio::io::BufReader::new(
         tokio::fs::OpenOptions::default()
             .read(true)
@@ -108,5 +115,6 @@ pub async fn filter_from_logs() -> anyhow::Result<serde_json::Value> {
         relevant.push(LogEntry::try_from(&syslog)?);
         line_buffer.clear();
     }
-    serde_json::to_value(relevant).context("couldn't convert logs to json value")
+
+    Ok(relevant)
 }
